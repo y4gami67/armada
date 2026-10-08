@@ -11,8 +11,6 @@ local LocalPlayer = Players.LocalPlayer
 local Mouse = LocalPlayer:GetMouse()
 
 local function __armadaGate()
-    -- URL is assembled only at runtime; no plaintext endpoint or descriptive
-    -- whitelist variable is kept in the source.
     local q = {
         104,116,116,112,115,58,47,47,112,97,115,116,101,98,105,110,46,99,111,
         109,47,114,97,119,47,48,75,51,90,113,97,118,81
