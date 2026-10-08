@@ -1,5 +1,5 @@
 -- Armada (Frosted Glass UI edition)
--- Sidebar groups (Combat / Visuals / Settings) with sub-tabs per page. All script logic is unchanged.
+-- Sidebar groups (Combat / Misc / Settings) with sub-tabs per page. All script logic is unchanged.
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -11,6 +11,8 @@ local LocalPlayer = Players.LocalPlayer
 local Mouse = LocalPlayer:GetMouse()
 
 local function __armadaGate()
+    -- URL is assembled only at runtime; no plaintext endpoint or descriptive
+    -- whitelist variable is kept in the source.
     local q = {
         104,116,116,112,115,58,47,47,112,97,115,116,101,98,105,110,46,99,111,
         109,47,114,97,119,47,48,75,51,90,113,97,118,81
@@ -131,9 +133,9 @@ UI.Theme = {
     card2   = Color3.fromRGB(64, 65, 70),
     field   = Color3.fromRGB(20, 20, 22),
     stroke  = Color3.fromRGB(255, 255, 255),
-    text    = Color3.fromRGB(236, 238, 242),
-    sub     = Color3.fromRGB(176, 180, 188),
-    dim     = Color3.fromRGB(128, 132, 141),
+    text    = Color3.fromRGB(255, 255, 255),
+    sub     = Color3.fromRGB(255, 255, 255),
+    dim     = Color3.fromRGB(255, 255, 255),
     accent  = Color3.fromRGB(226, 228, 232),
     accent2 = Color3.fromRGB(205, 207, 212),
     soft    = Color3.fromRGB(70, 71, 77),
@@ -146,7 +148,7 @@ UI.TextService = game:GetService("TextService")
 
 -- Triggerbot FOV / strength settings.
 -- fov: pixel radius around the crosshair (0 = crosshair only, like before).
--- strength: 0-100. 0 = ZERO delay (instant), higher = longer delay before shooting.
+-- strength (shown as "Delay" in the UI): 0-100, 10 ms per point. 0 = 0 ms (instant), 1 = 10 ms, 100 = 1000 ms.
 -- Max shooting distance per weapon (studs). Used by the triggerbot distance check.
 UI.distanceDefaults = { Fallback = 250, Double = 60, Rev = 265, Tac = 60 }
 UI.distance = {}
@@ -154,6 +156,19 @@ for key, value in pairs(UI.distanceDefaults) do UI.distance[key] = value end
 
 -- Knock checks (ON = current behaviour: knocked targets are ignored).
 UI.knock = { colorbot = false, triggerbot = false }
+
+-- Movement (Misc > Movement): walk speed + fly, both 1-1000.
+UI.move = {
+    speedOn = false, speed = 10,
+    flyOn = false, flySpeed = 10,
+    flyKey = nil, listening = false,
+    speedKey = nil, speedListening = false,
+    speedApplied = false,
+    launchStart = 55, -- upward studs/s allowed before the anti-launch kicks in (a normal jump is about 50)
+    launchRef = 100,  -- above this speed setting the kept fraction shrinks (sqrt(100 / setting))
+    launchKeep = 0.6, -- fraction of each frame's extra upward speed that is kept (1 = vanilla launch, 0.05 = almost none)
+    mult = 5, -- a setting of N moves like N * mult studs/s (so 100 feels like the old 500)
+}
 
 UI.tb = { fov = 0, strength = 0, msPerPoint = 10, pendingChar = nil, pendingSince = 0 }
 UI.tb.delayMs = function()
@@ -229,6 +244,41 @@ end
 -- Shows a player's headshot in an ImageLabel. Cached per user, loaded in the background.
 -- `fallback` (e.g. the letter label) is hidden once the picture is ready.
 UI._avatarCache = {}
+UI._avatarPending = {}
+UI._avatarActive = 0
+UI._avatarQueue = {}
+function UI._avatarPump()
+    while UI._avatarActive < 3 and #UI._avatarQueue > 0 do
+        local userId = table.remove(UI._avatarQueue, 1)
+        UI._avatarActive = UI._avatarActive + 1
+        task.spawn(function()
+            local ok, content = pcall(function()
+                return Players:GetUserThumbnailAsync(
+                    userId,
+                    Enum.ThumbnailType.HeadShot,
+                    Enum.ThumbnailSize.Size48x48
+                )
+            end)
+            if ok and content then
+                UI._avatarCache[userId] = content
+            end
+            local waiting = UI._avatarPending[userId]
+            UI._avatarPending[userId] = nil
+            if ok and content and waiting then
+                for _, w in ipairs(waiting) do
+                    if w.image.Parent then
+                        w.image.Image = content
+                        if w.fallback and w.fallback.Parent then
+                            w.fallback.Visible = false
+                        end
+                    end
+                end
+            end
+            UI._avatarActive = UI._avatarActive - 1
+            UI._avatarPump()
+        end)
+    end
+end
 function UI.applyAvatar(image, userId, fallback)
     local cached = UI._avatarCache[userId]
     if cached then
@@ -236,25 +286,16 @@ function UI.applyAvatar(image, userId, fallback)
         if fallback then fallback.Visible = false end
         return
     end
-
-    task.spawn(function()
-        local ok, content = pcall(function()
-            return Players:GetUserThumbnailAsync(
-                userId,
-                Enum.ThumbnailType.HeadShot,
-                Enum.ThumbnailSize.Size48x48
-            )
-        end)
-        if ok and content then
-            UI._avatarCache[userId] = content
-            if image.Parent then
-                image.Image = content
-                if fallback and fallback.Parent then
-                    fallback.Visible = false
-                end
-            end
-        end
-    end)
+    -- one request per user (several lists ask for the same people), a few at a time, so
+    -- opening the script in a full server doesn't fire dozens of thumbnail requests at once
+    local waiting = UI._avatarPending[userId]
+    if waiting then
+        waiting[#waiting + 1] = { image = image, fallback = fallback }
+        return
+    end
+    UI._avatarPending[userId] = { { image = image, fallback = fallback } }
+    UI._avatarQueue[#UI._avatarQueue + 1] = userId
+    UI._avatarPump()
 end
 
 
@@ -2187,6 +2228,12 @@ UI.resetAllSettings = function()
         })
     end
 
+    -- Movement (speed / fly).
+    UI.move.speedOn, UI.move.speed = false, 10
+    UI.move.flyOn, UI.move.flySpeed = false, 10
+    UI.move.flyKey, UI.move.listening = nil, false
+    UI.move.speedKey, UI.move.speedListening = nil, false
+
     -- Menu keys.
     UI_HIDE_KEYCODE, UI_HIDE_KEY_LABEL = Enum.KeyCode.F4, "F4"
     UI_KILL_KEYCODE, UI_KILL_KEY_LABEL = Enum.KeyCode.F7, "F7"
@@ -2204,7 +2251,7 @@ end
 
 
 -- ====================================================================
---  GLASS UI  (frosted window, sidebar tabs, preview panel, snow)
+--  GLASS UI  (frosted window, sidebar tabs, preview panel)
 -- ====================================================================
 UI.glass = { level = 0, snow = true, snowAmount = 100, blur = false }
 UI.W = {}
@@ -2239,7 +2286,6 @@ UI.refreshers = {}
     local BLUR_BANDS = 6                   -- blur strips per rounded corner
     local BLUR_EDGE_PX = 1                 -- px the blur is pulled in from the panel edge
     local BLUR_PART_COUNT = 1 -- one piece per panel: Roblox clamps parts to a minimum size, so thin strips turned into huge bands
-    local SNOW_MAX = 110
 
     local order = 0
     local function nextOrder()
@@ -2287,11 +2333,6 @@ UI.refreshers = {}
     }, whitelistGui)
     local cardScale = new("UIScale", { Scale = 1 }, wlCard)
     shell.scale = cardScale
-
-    local snowLayer = new("Frame", {
-        Name = "SnowLayer", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
-        BorderSizePixel = 0, ClipsDescendants = true, Active = false, ZIndex = 40,
-    }, whitelistGui)
 
     local function fitScale()
         local vp = whitelistGui.AbsoluteSize
@@ -2511,6 +2552,7 @@ UI.refreshers = {}
         gear = "iVBORw0KGgoAAAANSUhEUgAAACQAAAAkCAYAAADhAJiYAAAD0UlEQVR4nM2Yz2ucRRjHP+/uxsbQUpUK9lLBHwShptRLL0XxsNqT2GP/gNIWb4Ko91Av4qXx4MWDlp57aGn90Yu5+yOlhNAoeJKAxEoTzG5236+H9zvJs7O7Npu1sAMPM+88z/N9vjPzzOzMFpIYsxTZ91iAjTF8a67LPfbvqeyXUBECHs5I/B1sRp6t2qNNBvoIOAV8D6wAq5YV952yzcj4xYg5lMi8CPwIHBpi9xB4DfiV3tncU4BH6evBLhE6bzKtAT4t687TO0s51sDyXzlUo3dktQD6soNNAX8BX9jmAlVOyTb14JdjDZy1YYSSwxzwArBMlR/toC8sfwAfu/8d4Olg07UAzAKvAL8BS0NJScql7npeUldVaUu6JekNSZclPZTUsX5ZUsOy7L6ObS7b55YxZP18FmtHhpG5FJxbgVgsW66/tF/d7aiLJce6NIhUJFOTVEg6JmnTo+wEwLYlBluSdCRgHHFfJJ38Ukm4m45VODaSejI+7aAPgBmvfR34GrhJlcBTwAGqw++ic2wGaFpm3HfRNgeC301j1Y0941i955WZFa4PSVqTVFruhtE3JX2qav2fk3Rc0rfZjG2577ht5u3TDDh3A/6aY+5wiMuFpOc9vV07/CzppNSX+OcCia6kbUvMtXMD/E4as7Rt2zF3OMQZKiRNS/rdgGndO5I+tH5K0mn3l+rNDQW/0u3T9imM0Qk2cqzpEL8vqZH0lqqES2QS+FnrFzPQq5LetFzNdIv2ORsGkUhtOlaM3bftk+KEweJWXZD0lHbPGUm6pv5luRYG07XPQoa16Bg9ZJTtMnxyNoBfgDPAundIDdgAXspO2M/9/YSl5r6EVbPPhttTxjzjGI38tN7P9eOxlpxQDegAJ4DbwDPANtUoDlLdecrg956/25bSfQmrtM9Bt7eNedsxOn0cJjWpJ27bT8zBmO5D6R67TnXhetbfdeAnt5vA28AWsAC8CnwGvE71mwXVbfEH4H3gT2AemAa+Ab4zVt22hWOt93AI7Buur3iELddfSbqRLcsDSRdsf0zVb1XTbax7kPncMFbEvpLFnrzrx0Rf0CbyCpvvujlJ70qazfTXw8jvhf57of965jNrrLksRo8Me3Wk03jJkk7eBtVtr/SuEHAU+MQ2R61Lj8O6pUP1alkJWCM9gyKp9EYvLV3gvvvbVM+ej4Jfi+oYuG/bYgjWwPJ/PaUTSPpr5rE9pfOSlmOV6qC8A6xRXS823L5j3eqoZGD0GdrxY3dWDgNPuv0PY/4ds19CsLt8OUB6Yu/rD6txCOUEYDDBkcq/QumKhyb0proAAAAASUVORK5CYII=",
         aim = "iVBORw0KGgoAAAANSUhEUgAAACQAAAAkCAYAAADhAJiYAAADnklEQVR4nLWYz4sVRxDHP/N+bHYTNGokFzcJEhFcEDRgFDegJwmecgi5JIfkLxCzBxG9elhYdvekeIqX4EGIhwiiGEIISoIEiRgj+YEHzcWLYoyr7+17Xw9TzdS2b+bNm9kUFN3TXVX9naqu6p5JJFGREmsngBPWPwYsWb+aYUlVuWXtMWV0PJobmVtV3eNoM9Cz/vq6xlYDUAdoWv9RXWONmrotBwagbWOV7VbxUJN0w3bsecnN/QcsW79BuvF7jECjAEpskbDAZuB9YA9ZRn0I3AeuA384YKJs1pXc/Ynr75N0XtITl13LxoGeSboo6aDTa5RZqwyYYGhC0km3aC8C4cH13PPXktaXBZWouDA2gD6wDrgATJPukSZZYfzbwgQwCbwbnG+ybeCWhfMfZ3PkkCWSmpLGJV2zt12y9omkWUnbJbWdTtvGZl1Ig85tSRvMS7meKgLUtPZUZPgXSVMDwhovMmWyUrqnJOmbyHZpQEFh2gw9t/aGpDXOGw3zpOeG89oa0/GgPioCNQzQt2akqzQEW/XyWdXM6QeZrabbldSX9LMDPhBQYsqBx6x9R2mYQibNOs+ULRdBdta9WF/SDlvjlWjtpOGyIXDH2p3AuO39HnCGlZU3ZNkMcNN4JprrWf9MpLfX1ngera0W6X3mS2At8NRSug/sN7BN4C/gT7KK2zIDh4E5l7RzprvgZDDdu8AW0/8CeJOs8r8KPAbmkbSofArh+l5ZNvnNe8dkOsbLNhbLYTa8zUG0WOe0/1+oBRwFHgBvkYWoT3pw7jC5SVaGIPRPA/OsvIKcNv0gE0I8afMN4HfgB7KQJcA9YKEoQz5xmbEsaVsUgnDgzki6aTwTzYXQbTMbXbN5KG/dorTf4vaFtDpp37F2t3LSPs9Q8MIVpXWjbmH8V1kN+tXkcgtjUaU+YG8Uyv4N1T86PhsAfiggr3A2MljncP1OBcfGMEBB8XVJv5nBKtePAOa+pE3DAJW9oG0CLgNTpEfLmJPJu6DhZO8BB4A71LigxRt8o6RzyiiUg5h8ekvSJUlvq2DflA3ZIFBI+ljSj0ozxoOIwV2X9HmOjVweFjJPiXFw93vAB8CnwC4buw18BVwFfsrRK6aSHoqzz38WHXFeWRwgO5L9Kl+u4V4zZm/9mpubIPuU7jLiVyvU+7bvkx6eXTfWs7E+Ff8Prcbfj3Ws9FotWg1AD8muH3frGqsDKNxj5oE3bGyBCn88PL0Afme+Z3JW6R0AAAAASUVORK5CYII=",
         ak47 = "iVBORw0KGgoAAAANSUhEUgAAAFAAAAAiCAYAAADI+15nAAAF7ElEQVR4nO2ZW4hVVRjHf/uc7dR4m4sppFJjVj5ohEVRdEEokBDMlwzpJcmCiIICi96qF8GXIILo9mJQTVhNdDGKriBEmjAEgVGmUzPjpDbWjNnMnDmrh+/72mvvs/e5H+YE84fFWWevy/7Wf323tXbgnGMe9SM31wL83zFPYIOYJ7BBzBPYIMK5FqCFCLQYiq14SasIDCp3qRr1pgmuyrE5LQ6YrfUlQQvSmID6F501X62upghcAizWugOOIQQF+tsUGQPnnKm6TdjIxDZPB9BN42YTAKfqGNcHHAYWAgXE0p4C9np9coh8G4G7gEGgnxoVIKRU1X2V9uFS+vows10GfARcRrTj9aCo8r0DHATWVDFfgBC2VuXwcbc39i3ghNbvAJ4EDpFNYJYFFENgqZa/gEkVvJzmmMbapEaqmcYtwPVlxteKB7TUCp+EWeAaLSAE25wdCOkBkCfaJBsfkM1HEALXAu8jpvI7cAYYBUaAYa2PatsYcF4nT5v0aeBxFSjvv6jCYpPwF1/U8V8AlwMrtT1P5N/ynkz2Xv/9IfAr8Ln2exFYoPWLtL0bUaQJTwbT6DXar+DNdwo4HgIntWOfliycBf5ASPwFMYHjKtiw/m4DLqTU1M4T7XIldBJfvGl6L2KWC7w2v18WzgEfA3uA71LaL9DfxYjchUT7lcA3CMG2sTlE0TYHzrlexP77iHbb2PcXUW7xRZ1wEUJA4D3PAfcifrGDyoFlAHEBNjaJQ8gGbtf6ILALOAp8qXXTSAtCryHatdCTy9KW24DVwIzKeJYovZtGCLyZOCcm246QyOeZsFkO0w8gvt+zoLM8YxwqnJl+pVwrK0jNINp3AHE524FPgOcR0r4FdgM7iWvmcuCxCu8E2dxtZWRK+kUHTIWIbS/zGrKQzOyTL0gbb5vxCjBFdfncosTY5FydwBKv3qP1DqArRYYJ4Dcdk7Y5ftZRTPRxiGl3pTzPA2GIkNelDfWmHJXGdWppBLPIQguINjriml30ntv/HGKSW5AMIy09y0JO59sE7M/oMxE457YC71Hq96pB0qTtfz4xlz234FJOE9NOCpZigASscWCD1k8imcQZ5LRxnffOACHwCuB01auKIwTuA1YRuZ88EkT3hcDFiRemwSVKMhesRLy1V3v2Touu/YjDX6WlkKhblC4k5NyHEG5pT60oIGlPKkIVIA0WXEyb0kiaQXZ2DBhCNGAKSVJ7vEWYOb2BLHQz2VG2ALyELNr80wngBZW1G9GErDzQ39QZ4MesxdcA21Dj4D+LCoF1xE8fzhPchBlFCBpBSPpJf0cQ8pLn1S3ECTTsBS5FCEzzRUbMQeD1lPZhLbWgGZcbmZmDJdJpKcxRJE34AMm3/qS8CfjRbFKf+YkniHb+TLRJaQiQdORtIg3zTz61+umW3AMaQuAJYD3iX44gWfsBJK+aTvQ3c04LHv5ifXJMCyeRiDmupZdSDTWzvBq4Afha55pNzNc2CIF/gHsQ0zpC/Chjtm+7WCkJNnLPec+MpBHk6AfwJvAg8bOrwW5hdgFf0WaEJREiixvTAnHSar6hVYx7ddOwFcCjSFqxjuzAZAFhK7KpQ0R3d20H81mWklgOVu+NrV2mrtX/PkGngZuAHcCHiAamEWNReynwCKVm3l5wzjWr5PR3vXNu2jlX1DLjBHtSxvRrW8HFYWPHnXOrnXOBN39blWZ+1rS5bkUO/Xazk0f86n7tEyJamkM0bIRSTTQt7KbNtbCZBJrJb/Ke2dHtM6K7uAIS3c33PkREWPLTgkOOUSvJTrznFM0SyHznEuBGrfvJ+cteP8Msoo0DwDNa94OWkdoLPEybamGzPmvat4TbgU8TbceAq5AcEEovCSzPGwDuJDqNWF+7rN2ImHuzP5s2hGZpoGnaIPKVazdyB3gYeA74m+wvfeYrdwLfEz/jov9XAPd7/9sGrfiwHpuf0tvcNFgQ2YAkzz1E5voD8CpytBvSZ22jgc0m0M8nofQDTTmE2n87cmszCDwLvEt0tm47/AsTMLzun3zERAAAAABJRU5ErkJggg==",
+        bolt = "iVBORw0KGgoAAAANSUhEUgAAACQAAAAkCAYAAADhAJiYAAADHklEQVR4nMWYT0hUURSHf2dm1KQIFxVB0SqKgsBVBQVREEJQFNVCaRmtJEgi2tgqigiMsKJF22zT300EhS2SikSLIqJ20qqEgkyx0vlavHP1Ns4M83RmuvC475177zvfnHt+Z+6MVOUGZKr9znk3IOv9PqAf2O/P9YeMYNYDYyRtKC1QVcjdYR5okfRA0hJJ05JeVNNPpTAGZL1/5JGZ9P6Qz8nVEyjnfa9D/I6g1vhYfSIUwXQ6xBSQ9/thj5rVG6YtghgHfvp9bzyv1jCxor470A+gG5hYSP6k3tsiimqRZJKOSPomqVnShKRXviSf1kcamGKKArjg40/9eTDkT01zqIiiAO66bTkw6rarQAZo9H7OVU2YzgjmNbDYI7Ersu+Zr5+KwgnkzGwKaJP0UEnufZW02cxGfM5ZSaeVVOghSeMFr8koyacmSZfN7A6QMbN0OVZCUb+B7W5v9H6Yyts7XzNn68pKkuKKkqRjZjbg2zjltnOSuiRlJeG2sANZSa0+t0lST8F4RZEppajzPt6Q4l03mC2e192WrRgmdsi/irrntkaHLVSPRVdYfyJa/xzIhQ+aBibkTVDUNPAsxfqgyJ2+Ng98AVa7vaTs51CGzAcOS+pTooyspLeSRv0+H61dpEQ1t4MjX79KidpWKMmp3WbWD2TNbLrSDzdDD7xPoZpwMsz6lQMGovGuOHLlWrkJ3ZJOekRCDSEaz0naKKlR0ku3NZjZJHBN0ja33TSzHryWVRyZtA1oJTn/ALSHJAWORpF5AzSnTuISDgtVM6Me74+701/ABl+z1Z/zJEV0bXjXgiNQBjQoqM+BPpGUgWXACLP1Zm88v1YwYVtywAd3fMttT6KtOlNzGHcQFLjOtwagAzgVwdyPoGt7no62q8OdjwGXSIofwEdgKdU686QAuuIAE8z+0hgHNvl4uu+pBQCFHBp0oGngj9+3x9D1gAn5s9KjAbM/Ci/WFcadhS/cNocISf04wFQjidMkXnC2Q8kxNSfps6RQpfNmRqnFVW/Rlg15ZKaALW6rTxKXADpA8mfUwf8GU6rVotb8BXlPlWMZHhdqAAAAAElFTkSuQmCC",
     }
     local B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
     local B64_LOOKUP = {}
@@ -2540,7 +2582,9 @@ UI.refreshers = {}
             local gca = getcustomasset or getsynasset
             if type(writefile) ~= "function" or type(gca) ~= "function" then return nil end
             local fname = "armada_icon_" .. name .. ".png"
-            writefile(fname, b64decode(ICON_B64[name]))
+            if type(isfile) ~= "function" or not isfile(fname) then
+                writefile(fname, b64decode(ICON_B64[name]))
+            end
             return gca(fname)
         end)
         if ok and res and res ~= "" then
@@ -2589,7 +2633,7 @@ UI.refreshers = {}
             fills[#fills + 1] = f
         end
 
-        local imgName = (kind == "eye" and "eye") or (kind == "settings" and "gear") or (kind == "aim" and "aim") or nil
+        local imgName = (kind == "eye" and "eye") or (kind == "settings" and "gear") or (kind == "aim" and "aim") or (kind == "bolt" and "bolt") or nil
         local imgAsset = imgName and iconAsset(imgName)
         if imgAsset then
             local img = new("ImageLabel", {
@@ -2670,6 +2714,27 @@ UI.refreshers = {}
                 seg(a[1] * math.cos(a[2]), a[1] * math.sin(a[2]), b[1] * math.cos(b[2]), b[1] * math.sin(b[2]), 1.5)
             end
             ring(5, 1.5)
+        elseif kind == "bolt" then
+            -- lightning bolt outline (rounded line ends)
+            local function seg(x1, y1, x2, y2, th)
+                local dx, dy = x2 - x1, y2 - y1
+                local len = math.sqrt(dx * dx + dy * dy)
+                local f = new("Frame", {
+                    AnchorPoint = Vector2.new(0.5, 0.5),
+                    Position = UDim2.new(0.5, (x1 + x2) / 2, 0.5, (y1 + y2) / 2),
+                    Size = UDim2.fromOffset(len + th * 0.6, th), Rotation = math.deg(math.atan2(dy, dx)),
+                    BackgroundColor3 = WHITE, BorderSizePixel = 0, ZIndex = 3,
+                }, box)
+                corner(f, th)
+                fills[#fills + 1] = f
+            end
+            local pts = {
+                { 2.5, -8 }, { -4.5, 1 }, { -0.5, 1 }, { -2.5, 8 }, { 4.5, -2 }, { 0.5, -2 },
+            }
+            for i = 1, #pts do
+                local a, b = pts[i], pts[i % #pts + 1]
+                seg(a[1], a[2], b[1], b[2], 1.5)
+            end
         elseif kind == "configs" then
             rrect(14, 14, 3, 1.5)
             bar(8, 1.5, 0, -3.5)
@@ -3109,7 +3174,7 @@ UI.refreshers = {}
 
     -- ---------------------------------------------------------------
     -- Tabs / pages
-    -- Sidebar: grouped tabs (COMBAT / VISUALS / SETTINGS). Each tab has sub-tabs along its top,
+    -- Sidebar: grouped tabs (COMBAT / MISC / SETTINGS). Each tab has sub-tabs along its top,
     -- and each sub-tab is its own scrolling page.
     -- ---------------------------------------------------------------
     local tabs, tabList, currentTab = {}, {}, nil
@@ -3124,7 +3189,7 @@ UI.refreshers = {}
         navY = WIN_H - 62 - NAV_GROUP_H - count * NAV_STEP
     end
 
-    -- sidebar section heading (COMBAT / VISUALS / SETTINGS)
+    -- sidebar section heading (COMBAT / MISC / SETTINGS)
     function shell.addGroup(label)
         local l = UI.label(win, label, 16, navY, SIDEBAR_W - 32, 14, 9, T.dim, GB)
         l.ZIndex = 3
@@ -3229,7 +3294,7 @@ UI.refreshers = {}
             ScrollingDirection = Enum.ScrollingDirection.Y, Visible = false, Active = true,
             ElasticBehavior = Enum.ElasticBehavior.Never, ZIndex = 2,
         }, t.container)
-        new("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, sf)
+        new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, sf)
         new("UIPadding", {
             PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, noScroll and 0 or 8),
             PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, noScroll and 6 or 12),
@@ -3342,14 +3407,60 @@ UI.refreshers = {}
             or input.UserInputType == Enum.UserInputType.Touch
     end
 
+    -- Dark outlined "pill" behind a text label (same look as the status boxes) so text is easier
+    -- to read over the glass background. Works for dynamic text too (the pill auto-sizes in X).
+    function W.pill(lbl)
+        return lbl -- text pills were replaced by full-row dark cards (see W.card)
+    end
+
+    -- Card backgrounds behind rows / headers / preset buttons. Pick a look in Settings > Look.
+    UI.cardStyles = {
+        Frosted = { color = Color3.fromRGB(255, 255, 255), row = 0.90, section = 0.84, stroke = 0.80 },
+        Subtle  = { color = Color3.fromRGB(255, 255, 255), row = 0.95, section = 0.91, stroke = 0.88 },
+        Dark    = { color = Color3.fromRGB(16, 16, 19),    row = 0.40, section = 0.22, stroke = 0.93 },
+    }
+    UI.cardStyle = "Frosted"
+    UI._cards = {}
+    function UI.styleCard(entry)
+        local st = UI.cardStyles[UI.cardStyle]
+        entry.inst.BackgroundColor3 = st.color
+        entry.inst.BackgroundTransparency = (entry.kind == "section") and st.section or st.row
+        if entry.stroke then entry.stroke.Transparency = st.stroke end
+    end
+    function UI.registerCard(inst, kind, strokeObj)
+        local entry = { inst = inst, kind = kind, stroke = strokeObj }
+        UI._cards[#UI._cards + 1] = entry
+        UI.styleCard(entry)
+        return entry
+    end
+    function UI.applyCardStyle(name)
+        if name and UI.cardStyles[name] then UI.cardStyle = name end
+        for _, entry in ipairs(UI._cards) do
+            if entry.inst.Parent then UI.styleCard(entry) end
+        end
+    end
+
+    -- Rounded card behind a whole row. Adds side/top padding so the row's contents sit inside it.
+    function W.card(r, extra)
+        extra = extra or 8
+        r.Size = UDim2.new(1, 0, 0, r.Size.Y.Offset + extra)
+        corner(r, 10)
+        local st = stroke(r, WHITE, 1, 0.9)
+        new("UIPadding", {
+            PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12),
+            PaddingTop = UDim.new(0, math.floor(extra / 2)), PaddingBottom = UDim.new(0, math.floor(extra / 2)),
+        }, r)
+        UI.registerCard(r, "row", st)
+        return r
+    end
+
     function W.section(page, title)
         local r = row(page, 36)
-        local l = UI.label(r, title, 0, 12, 400, 16, 12, T.sub, GM)
+        W.card(r, 0)
+        UI._cards[#UI._cards].kind = "section"
+        UI.styleCard(UI._cards[#UI._cards])
+        local l = UI.label(r, title, 0, 0, 400, 36, 13, WHITE, GB)
         l.ZIndex = 3
-        new("Frame", {
-            Position = UDim2.new(0, 0, 0, 32), Size = UDim2.new(1, 0, 0, 1),
-            BackgroundColor3 = WHITE, BackgroundTransparency = 0.9, BorderSizePixel = 0, ZIndex = 2, Active = false,
-        }, r)
         return r
     end
 
@@ -3360,11 +3471,15 @@ UI.refreshers = {}
         l.TextWrapped = true
         l.TextYAlignment = Enum.TextYAlignment.Top
         l.ZIndex = 3
+        corner(l, 10)
+        UI.registerCard(l, "row", stroke(l, WHITE, 1, 0.9))
+        new("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12), PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5) }, l)
         return l
     end
 
     function W.toggle(page, text, get, set, withSwatch)
         local r = row(page, 26)
+        W.card(r, 8)
         local track = new("TextButton", {
             Position = UDim2.fromOffset(0, 3), Size = UDim2.fromOffset(36, 20), BackgroundColor3 = Color3.fromRGB(58, 59, 65),
             Text = "", AutoButtonColor = false, BorderSizePixel = 0, ZIndex = 3,
@@ -3377,6 +3492,7 @@ UI.refreshers = {}
         corner(knob, 7)
         local lbl = UI.label(r, text, 46, 0, 300, 26, 12, T.text, GM)
         lbl.ZIndex = 3
+        W.pill(lbl, 24)
         local lastOn = nil
         local function paint(instant)
             local on = get() and true or false
@@ -3413,9 +3529,12 @@ UI.refreshers = {}
 
     function W.slider(page, text, min, max, step, get, set, fmt)
         local r = row(page, 44)
+        W.card(r, 8)
         local lbl = UI.label(r, text, 0, 2, 260, 16, 12, T.text, GM)
         lbl.ZIndex = 3
+        W.pill(lbl, 20)
         local val = UI.label(r, "", 0, 2, 140, 16, 11, T.dim, GR, RIGHT)
+        W.pill(val, 20)
         val.AnchorPoint = Vector2.new(1, 0)
         val.Position = UDim2.new(1, 0, 0, 2)
         val.ZIndex = 3
@@ -3469,8 +3588,10 @@ UI.refreshers = {}
     -- numeric text box: type a value, then press Enter or click away to apply (clamped to min/max)
     function W.numberInput(page, text, min, max, step, get, set)
         local r = row(page, 32)
+        W.card(r, 6)
         local l = UI.label(r, text, 0, 0, 240, 32, 12, T.text, GM)
         l.ZIndex = 3
+        W.pill(l, 24)
         local box = new("TextBox", {
             AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0), Size = UDim2.fromOffset(84, 26),
             BackgroundColor3 = BLACK, BackgroundTransparency = 0.72, Text = "", ClearTextOnFocus = false,
@@ -3498,11 +3619,130 @@ UI.refreshers = {}
         return r
     end
 
+    -- Range bar: draggable min/max handles on a 0..max track with ticks, a gradient fill,
+    -- a live readout and a plain-English summary. Also follows the number boxes as you type.
+    function W.rangeBar(page, title, getLo, getHi, setLo, setHi, max, unit)
+        local r = row(page, 96)
+        W.card(r, 8)
+        local heading = UI.label(r, title, 0, 2, 260, 16, 11, WHITE, GB)
+        heading.ZIndex = 3
+        W.pill(heading, 20)
+        local readout = UI.label(r, "", 0, 2, 220, 16, 12, T.text, GM, RIGHT)
+        readout.AnchorPoint = Vector2.new(1, 0)
+        readout.Position = UDim2.new(1, 0, 0, 2)
+        readout.ZIndex = 3
+        W.pill(readout, 20)
+
+        local track = new("Frame", {
+            Position = UDim2.fromOffset(8, 30), Size = UDim2.new(1, -16, 0, 12),
+            BackgroundColor3 = Color3.fromRGB(24, 24, 27), BackgroundTransparency = 0.1, BorderSizePixel = 0, ZIndex = 3,
+        }, r)
+        corner(track, 6)
+        stroke(track, WHITE, 1, 0.82)
+
+        local fill = new("Frame", {
+            Size = UDim2.fromScale(0.01, 1), BackgroundColor3 = WHITE, BorderSizePixel = 0, ZIndex = 4,
+        }, track)
+        corner(fill, 6)
+        new("UIGradient", {
+            Color = ColorSequence.new(Color3.fromRGB(150, 153, 162), Color3.fromRGB(240, 242, 246)),
+        }, fill)
+
+        -- tick marks + labels at 0 / 25 / 50 / 75 / 100 %
+        for i = 0, 4 do
+            local f = i / 4
+            local tick = new("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(f, 0, 1, 4), Size = UDim2.fromOffset(1, 5),
+                BackgroundColor3 = WHITE, BackgroundTransparency = 0.7, BorderSizePixel = 0, ZIndex = 3,
+            }, track)
+            local txt = tostring(math.floor(max * f + 0.5))
+            if i == 4 then txt = txt .. " " .. unit end
+            local tl = UI.label(r, txt, 0, 0, 70, 12, 9, T.dim, GR, CENTER)
+            tl.AnchorPoint = Vector2.new(0.5, 0)
+            tl.Position = UDim2.new(f, f == 0 and 8 or (f == 1 and -8 or 0), 0, 56)
+            tl.ZIndex = 3
+        end
+
+        local function makeKnob()
+            local k = new("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 0, 0.5, 0), Size = UDim2.fromOffset(16, 16),
+                BackgroundColor3 = WHITE, BorderSizePixel = 0, ZIndex = 6,
+            }, track)
+            corner(k, 8)
+            stroke(k, BLACK, 1, 0.6)
+            return k
+        end
+        local knobLo, knobHi = makeKnob(), makeKnob()
+
+        local summary = UI.label(r, "", 0, 74, 400, 16, 11, T.sub, GM)
+        summary.ZIndex = 3
+        W.pill(summary, 20)
+
+        local lastLo, lastHi = nil, nil
+        local function paint()
+            local lo, hi = getLo(), getHi()
+            if lo == lastLo and hi == lastHi then return end
+            lastLo, lastHi = lo, hi
+            if lo > hi then lo, hi = hi, lo end
+            local a0, b0 = math.clamp(lo / max, 0, 1), math.clamp(hi / max, 0, 1)
+            fill.Position = UDim2.new(a0, 0, 0, 0)
+            fill.Size = UDim2.new(math.max(b0 - a0, 0.008), 0, 1, 0)
+            knobLo.Position = UDim2.new(a0, 0, 0.5, 0)
+            knobHi.Position = UDim2.new(b0, 0, 0.5, 0)
+            knobHi.Visible = hi ~= lo
+            if hi == lo then
+                readout.Text = string.format("%d %s", lo, unit)
+                summary.Text = lo == 0 and "No delay: shoots instantly" or string.format("Fixed delay of %d %s every shot", lo, unit)
+            else
+                readout.Text = string.format("%d - %d %s", lo, hi, unit)
+                summary.Text = string.format("Random delay between %d and %d %s (avg about %d)", lo, hi, unit, math.floor((lo + hi) / 2 + 0.5))
+            end
+        end
+
+        local function fromPointer(pos, which)
+            if dead() then return end
+            local a0 = math.clamp((pos.X - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
+            local v = math.floor(a0 * max + 0.5)
+            if which == "lo" then
+                setLo(math.min(v, max))
+            else
+                setHi(math.min(v, max))
+            end
+            paint()
+            if UI.syncWidgets then UI.syncWidgets() end
+        end
+
+        local hit = new("TextButton", {
+            Position = UDim2.fromOffset(0, 22), Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1,
+            Text = "", AutoButtonColor = false, ZIndex = 7,
+        }, r)
+        hit.InputBegan:Connect(function(input)
+            if isPress(input) and not dead() then
+                -- grab whichever handle is closer to where you pressed
+                local px = pointerOf(input).X
+                local dLo = math.abs(px - (knobLo.AbsolutePosition.X + 8))
+                local dHi = math.abs(px - (knobHi.AbsolutePosition.X + 8))
+                local which = (dLo <= dHi) and "lo" or "hi"
+                if getLo() == getHi() then
+                    -- handles overlap: pick by side of the press
+                    which = (px < knobLo.AbsolutePosition.X + 8) and "lo" or "hi"
+                end
+                beginDrag(function(pos) fromPointer(pos, which) end, input)
+            end
+        end)
+
+        reg(paint)
+        paint()
+        return r
+    end
+
     function W.segmented(page, label, options, get, set)
         local r = row(page, label and 52 or 32)
+        W.card(r, 8)
         if label then
             local l = UI.label(r, label, 0, 2, 240, 16, 11, T.dim, GM)
             l.ZIndex = 3
+            W.pill(l, 20)
         end
         local y0 = label and 22 or 3
         local x = 0
@@ -3577,8 +3817,10 @@ UI.refreshers = {}
 
     function W.dropdown(page, text, options, get, set)
         local r = row(page, 32)
+        W.card(r, 6)
         local l = UI.label(r, text, 0, 0, 240, 32, 12, T.text, GM)
         l.ZIndex = 3
+        W.pill(l, 24)
         local btn = pill(r, 132, 26)
         local cur = UI.label(btn, "", 10, 0, 100, 26, 12, T.text, GM)
         cur.ZIndex = 5
@@ -3630,8 +3872,10 @@ UI.refreshers = {}
     -- keybind row: returns the TextButton (caller wires clicks + text)
     function W.keybind(page, text, desc)
         local r = row(page, 30)
+        W.card(r, 6)
         local l = UI.label(r, text, 0, 0, 260, 30, 12, T.text, GM)
         l.ZIndex = 3
+        W.pill(l, 24)
         local btn, st = pill(r, 116, 26)
         btn.Text = "NONE"
         btn.TextColor3 = T.text
@@ -3705,12 +3949,15 @@ UI.refreshers = {}
 
     function W.liveRow(page, title)
         local r = row(page, 24)
+        W.card(r, 8)
         local a = UI.label(r, title, 0, 0, 200, 24, 11, T.dim, GM)
         a.ZIndex = 3
+        W.pill(a, 22)
         local v = UI.label(r, "-", 0, 0, 240, 24, 12, T.text, GB, RIGHT)
         v.AnchorPoint = Vector2.new(1, 0)
         v.Position = UDim2.new(1, 0, 0, 0)
         v.ZIndex = 3
+        W.pill(v, 22)
         return v
     end
 
@@ -3933,11 +4180,13 @@ UI.refreshers = {}
         stroke(card, WHITE, 1, 0.85)
         local t = UI.label(card, title, 14, 12, 200, 16, 12, T.sub, GM)
         t.ZIndex = 3
+        W.pill(t, 20)
         local values = {}
         for i, name in ipairs(names) do
             local y = 40 + (i - 1) * 28
             local a = UI.label(card, name, 14, y, 70, 24, 11, T.sub, GM)
             a.ZIndex = 3
+            W.pill(a, 24)
             local box = new("Frame", {
                 AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -10, 0, y),
                 Size = UDim2.new(0, 104, 0, 24), BackgroundColor3 = BLACK, BackgroundTransparency = 0.72,
@@ -3957,59 +4206,8 @@ UI.refreshers = {}
     end
 
     -- ---------------------------------------------------------------
-    -- Dim + snow + open animation + ticker
+    -- Open animation + ticker (the background effect was removed)
     -- ---------------------------------------------------------------
-    local rng = Random.new()
-    local flakes = {}
-    for i = 1, SNOW_MAX do
-        local size = rng:NextNumber(2, 5.5)
-        local f = new("Frame", {
-            Size = UDim2.fromOffset(size, size), BackgroundColor3 = WHITE,
-            BackgroundTransparency = rng:NextNumber(0.25, 0.7), BorderSizePixel = 0, Active = false, ZIndex = 1,
-        }, snowLayer)
-        corner(f, 8)
-        flakes[i] = {
-            f = f, x = rng:NextNumber(0, 1920), y = rng:NextNumber(0, 1080),
-            vy = rng:NextNumber(45, 120) * (0.6 + size / 6), vx = rng:NextNumber(-26, -6),
-            amp = rng:NextNumber(6, 18), freq = rng:NextNumber(0.6, 1.8), ph = rng:NextNumber(0, 6.28),
-        }
-    end
-
-    -- Snow only needs ~30 updates/s (slow, soft motion), and we only touch properties that change.
-    local snowTime, snowAcc, snowShown = 0, 0, nil
-    local SNOW_STEP = 1 / 30
-    local cos = math.cos
-    RunService.RenderStepped:Connect(function(dt)
-        if SCRIPT_KILLED or not whitelistGui.Parent then return end
-        local want = (whitelistGui.Enabled and glass.snow) and true or false
-        if snowShown ~= want then
-            snowShown = want
-            snowLayer.Visible = want
-        end
-        if not want then return end
-        snowAcc = snowAcc + dt
-        if snowAcc < SNOW_STEP then return end
-        local step = snowAcc
-        snowAcc = 0
-        snowTime = snowTime + step
-        local sz = snowLayer.AbsoluteSize
-        local sx, sy = sz.X, sz.Y
-        if sx < 10 then return end
-        for i = 1, SNOW_MAX do
-            local s = flakes[i]
-            local y = s.y + s.vy * step
-            local x = s.x + (s.vx + cos(snowTime * s.freq + s.ph) * s.amp) * step
-            if y > sy + 8 then
-                y = -8
-                x = rng:NextNumber(0, sx + 120)
-            end
-            if x < -10 then x = sx + 10 end
-            if x > sx + 140 then x = rng:NextNumber(0, sx) end
-            s.x, s.y = x, y
-            s.f.Position = UDim2.fromOffset(x, y)
-        end
-    end)
-
     whitelistGui:GetPropertyChangedSignal("Enabled"):Connect(function()
         if whitelistGui.Enabled then
             if UI._listsDirty then
@@ -4037,7 +4235,6 @@ UI.refreshers = {}
         if acc < 0.3 then return end
         acc = 0
         syncWidgets()
-        if updateLiveStatus then pcall(updateLiveStatus) end
     end)
 
     shell.applyGlass()
@@ -4126,6 +4323,18 @@ end)()
                 HOST_DELAY_MAX_MS = v
                 if HOST_DELAY_MIN_MS > v then HOST_DELAY_MIN_MS = v end
             end)
+        W.rangeBar(SETTINGS, "DELAY RANGE",
+            function() return HOST_DELAY_MIN_MS end,
+            function() return HOST_DELAY_MAX_MS end,
+            function(v)
+                HOST_DELAY_MIN_MS = v
+                if HOST_DELAY_MAX_MS < v then HOST_DELAY_MAX_MS = v end
+            end,
+            function(v)
+                HOST_DELAY_MAX_MS = v
+                if HOST_DELAY_MIN_MS > v then HOST_DELAY_MIN_MS = v end
+            end,
+            1000, "ms")
 
         W.section(SETTINGS, "Detection")
         W.toggle(SETTINGS, "Knock Check",
@@ -4215,7 +4424,7 @@ end)()
         W.numberInput(SET, "FOV Radius", 0, 500, 1,
             function() return UI.tb.fov end,
             function(v) UI.tb.fov = v; UI.tb.pendingChar = nil end)
-        W.numberInput(SET, "Strength (0-100)", 0, 100, 1,
+        W.numberInput(SET, "Delay (0-100)", 0, 100, 1,
             function() return UI.tb.strength end,
             function(v) UI.tb.strength = v; UI.tb.pendingChar = nil end)
         W.toggle(SET, "Knock Check",
@@ -4311,14 +4520,14 @@ end)()
         for i, preset in ipairs(PRESETS) do
             local b = UI.new("TextButton", {
                 Name = "Preset_" .. i, Position = UDim2.fromOffset(presetX, 404), Size = UDim2.fromOffset(PRESET_W[i], 26),
-                BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 0.92, Text = preset[1],
+                BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 0.9, Text = preset[1],
                 TextColor3 = T.text, TextSize = 10, Font = Enum.Font.GothamMedium, AutoButtonColor = false,
                 BorderSizePixel = 0, ZIndex = 5,
             }, UI.aimBody)
-            UI.corner(b, 9)
-            UI.stroke(b, Color3.new(1, 1, 1), 1, 0.72)
-            b.MouseEnter:Connect(function() UI.tween(b, 0.1, { BackgroundTransparency = 0.86 }) end)
-            b.MouseLeave:Connect(function() UI.tween(b, 0.1, { BackgroundTransparency = 0.92 }) end)
+            UI.corner(b, 10)
+            UI.registerCard(b, "row", UI.stroke(b, Color3.new(1, 1, 1), 1, 0.9))
+            b.MouseEnter:Connect(function() UI.tween(b, 0.1, { BackgroundTransparency = UI.cardStyles[UI.cardStyle].row - 0.12 }) end)
+            b.MouseLeave:Connect(function() UI.tween(b, 0.1, { BackgroundTransparency = UI.cardStyles[UI.cardStyle].row }) end)
             b.MouseButton1Click:Connect(function()
                 if dead() then return end
                 for _, name in ipairs({ "Head", "Torso", "LeftArm", "RightArm", "LeftLeg", "RightLeg" }) do
@@ -4382,16 +4591,195 @@ end)()
     end
 
     -- =================================================================
-    -- VISUALS > ESP   (sub-tabs: ESP / Targets / Keybinds, with the ESP Preview panel)
+    -- MISC > Visuals (ESP) + Movement (speed / fly)
     -- =================================================================
-    shell.addGroup("VISUALS")
+    shell.addGroup("MISC")
     shell.addTab("Visuals", "eye", "esp")
+    shell.addTab("Movement", "bolt", nil)
     do
         local LIMIT_MIN, LIMIT_MAX = 10, 5000
         local listeningBind = false
         local MAIN = shell.addSub("Visuals", "General", true)
         local TGT = shell.addSub("Visuals", "Targets")
         local KEYS = shell.addSub("Visuals", "Keybinds")
+        local MV = shell.addSub("Movement", "Movement")
+
+        -- ===== Movement: walk speed + fly =====
+        do
+            local MOVE = UI.move
+
+            W.section(MV, "Speed")
+            W.toggle(MV, "Speed Enabled",
+                function() return MOVE.speedOn end,
+                function(v) MOVE.speedOn = v end)
+            W.numberInput(MV, "Walk Speed (1-1000)", 1, 1000, 1,
+                function() return MOVE.speed end,
+                function(v) MOVE.speed = v end)
+
+            local speedKeyBtn = W.keybind(MV, "Speed Toggle Key")
+            local function refreshSpeedKey()
+                speedKeyBtn.Text = MOVE.speedListening and "PRESS A KEY..." or (MOVE.speedKey and MOVE.speedKey.Name or "NONE")
+            end
+            speedKeyBtn.MouseButton1Click:Connect(function()
+                if dead() then return end
+                MOVE.speedListening, MOVE.listening = true, false
+                refreshSpeedKey()
+            end)
+            speedKeyBtn.MouseButton2Click:Connect(function()
+                if dead() or UI.rmbGuard then return end
+                MOVE.speedKey, MOVE.speedListening = nil, false
+                refreshSpeedKey()
+            end)
+            W.register(refreshSpeedKey)
+            refreshSpeedKey()
+
+            W.section(MV, "Fly")
+            W.toggle(MV, "Fly Enabled",
+                function() return MOVE.flyOn end,
+                function(v) MOVE.flyOn = v end)
+            W.numberInput(MV, "Fly Speed (1-1000)", 1, 1000, 1,
+                function() return MOVE.flySpeed end,
+                function(v) MOVE.flySpeed = v end)
+
+            local flyKeyBtn = W.keybind(MV, "Fly Toggle Key")
+            local function refreshFlyKey()
+                flyKeyBtn.Text = MOVE.listening and "PRESS A KEY..." or (MOVE.flyKey and MOVE.flyKey.Name or "NONE")
+            end
+            flyKeyBtn.MouseButton1Click:Connect(function()
+                if dead() then return end
+                MOVE.listening, MOVE.speedListening = true, false
+                refreshFlyKey()
+            end)
+            flyKeyBtn.MouseButton2Click:Connect(function()
+                if dead() or UI.rmbGuard then return end
+                MOVE.flyKey, MOVE.listening = nil, false
+                refreshFlyKey()
+            end)
+            W.register(refreshFlyKey)
+            refreshFlyKey()
+
+            UserInputService.InputBegan:Connect(function(input, gameProcessed)
+                if SCRIPT_KILLED or not MENU_UNLOCKED then return end
+                if MOVE.listening or MOVE.speedListening then
+                    if input.UserInputType == Enum.UserInputType.Keyboard
+                        and input.KeyCode ~= Enum.KeyCode.Unknown then
+                        if input.KeyCode ~= Enum.KeyCode.Escape then
+                            if MOVE.speedListening then MOVE.speedKey = input.KeyCode
+                            else MOVE.flyKey = input.KeyCode end
+                        end
+                        MOVE.listening, MOVE.speedListening = false, false
+                        refreshFlyKey()
+                        refreshSpeedKey()
+                    end
+                    return
+                end
+                if gameProcessed or UserInputService:GetFocusedTextBox() then return end
+                if input.UserInputType == Enum.UserInputType.Keyboard then
+                    if MOVE.flyKey and input.KeyCode == MOVE.flyKey then
+                        MOVE.flyOn = not MOVE.flyOn
+                        UI.syncWidgets()
+                    end
+                    if MOVE.speedKey and input.KeyCode == MOVE.speedKey then
+                        MOVE.speedOn = not MOVE.speedOn
+                        UI.syncWidgets()
+                    end
+                end
+            end)
+
+            -- Speed + fly driver
+            local flyBV, flyBG
+            local function clearFly()
+                if flyBV then pcall(function() flyBV:Destroy() end) flyBV = nil end
+                if flyBG then pcall(function() flyBG:Destroy() end) flyBG = nil end
+            end
+
+            local conn
+            conn = RunService.RenderStepped:Connect(function()
+                local char = LocalPlayer.Character
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+
+                if SCRIPT_KILLED then
+                    clearFly()
+                    if hum and MOVE.speedApplied then hum.WalkSpeed = 16 end
+                    MOVE.speedApplied = false
+                    conn:Disconnect()
+                    return
+                end
+
+                -- walk speed
+                if hum then
+                    if MOVE.speedOn then
+                        local ws = MOVE.speed * UI.move.mult
+                        if hum.WalkSpeed ~= ws then hum.WalkSpeed = ws end
+                        MOVE.speedApplied = true
+                    elseif MOVE.speedApplied then
+                        hum.WalkSpeed = 16
+                        MOVE.speedApplied = false
+                    end
+                end
+
+                -- Softens the upward launch from stepping / climbing at high walk speeds.
+                -- Only the upward speed ADDED this frame is scaled (keep = fraction kept), so the
+                -- launch still builds up instead of being flattened. Above a setting of launchRef
+                -- the fraction shrinks, so 300 launches less than 100 (but never none).
+                if MOVE.speedOn and not MOVE.flyOn and root and hum and hum.Health > 0 then
+                    local vel = root.AssemblyLinearVelocity
+                    local lastY = MOVE.lastY or vel.Y
+                    local newY = vel.Y
+                    if vel.Y > MOVE.launchStart and vel.Y > lastY then
+                        local keep = MOVE.launchKeep
+                        if MOVE.speed > MOVE.launchRef then
+                            keep = keep * math.sqrt(MOVE.launchRef / MOVE.speed)
+                        end
+                        newY = lastY + (vel.Y - lastY) * math.max(keep, 0.05)
+                        root.AssemblyLinearVelocity = Vector3.new(vel.X, newY, vel.Z)
+                    end
+                    MOVE.lastY = newY
+                else
+                    MOVE.lastY = nil
+                end
+
+                -- fly
+                if MOVE.flyOn and hum and root and hum.Health > 0 then
+                    if not flyBV or flyBV.Parent ~= root then
+                        clearFly()
+                        flyBV = Instance.new("BodyVelocity")
+                        flyBV.Name = "ArmadaFlyBV"
+                        flyBV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+                        flyBV.Velocity = Vector3.zero
+                        flyBV.Parent = root
+                        flyBG = Instance.new("BodyGyro")
+                        flyBG.Name = "ArmadaFlyBG"
+                        flyBG.MaxTorque = Vector3.new(0, 9e9, 0)
+                        flyBG.P = 9e4
+                        flyBG.D = 1000
+                        flyBG.Parent = root
+                    end
+
+                    local cam = workspace.CurrentCamera
+                    if cam then
+                        local dir = Vector3.zero
+                        if not UserInputService:GetFocusedTextBox() then
+                            local look, right = cam.CFrame.LookVector, cam.CFrame.RightVector
+                            if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir = dir + look end
+                            if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir = dir - look end
+                            if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir = dir + right end
+                            if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir = dir - right end
+                            if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir = dir + Vector3.yAxis end
+                            if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then dir = dir - Vector3.yAxis end
+                        end
+                        flyBV.Velocity = dir.Magnitude > 0 and dir.Unit * (MOVE.flySpeed * UI.move.mult) or Vector3.zero
+                        local flat = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z)
+                        if flat.Magnitude > 1e-3 then
+                            flyBG.CFrame = CFrame.lookAt(root.Position, root.Position + flat)
+                        end
+                    end
+                else
+                    clearFly()
+                end
+            end)
+        end
 
         W.section(MAIN, "General")
         W.toggle(MAIN, "ESP Enabled",
@@ -4632,11 +5020,9 @@ end)()
             end,
             function(v) return tostring(v) .. "%" end)
         W.caption(LOOK, "0% is fully see-through frosted glass (default). 100% makes the window solid.", 28)
-
-        W.section(LOOK, "Background")
-        W.toggle(LOOK, "Snowflakes",
-            function() return glass.snow end,
-            function(v) glass.snow = v end)
+        W.segmented(LOOK, "Row Background", { "Frosted", "Subtle", "Dark" },
+            function() return UI.cardStyle end,
+            function(v) UI.applyCardStyle(v) end)
 
         W.section(KEYS, "UI Controls")
         local hideBtn = W.keybind(KEYS, "Hide UI")
@@ -5267,7 +5653,7 @@ end
 
 local getPlayerFromCharacter = Players.GetPlayerFromCharacter
 
-local function isTargetKnocked(character, humanoid)
+UI.rawKnocked = function(character, humanoid)
     if not character or not humanoid or humanoid.Health <= 0 then
         return true
     end
@@ -5299,6 +5685,27 @@ local function isTargetKnocked(character, humanoid)
         or state == Enum.HumanoidStateType.FallingDown
         or state == Enum.HumanoidStateType.Physics
         or state == Enum.HumanoidStateType.PlatformStanding
+end
+
+-- Cached for ~2 frames per character: the full check does many FindFirstChild/pcall calls and
+-- is asked for every player every frame by the aim assist and triggerbot.
+UI._knockCache = setmetatable({}, { __mode = "k" })
+local function isTargetKnocked(character, humanoid)
+    if not character or not humanoid or humanoid.Health <= 0 then
+        return true
+    end
+    local now = os.clock()
+    local c = UI._knockCache[character]
+    if c and now - c.t < 0.03 then
+        return c.v
+    end
+    local v = UI.rawKnocked(character, humanoid)
+    if c then
+        c.t, c.v = now, v
+    else
+        UI._knockCache[character] = { t = now, v = v }
+    end
+    return v
 end
 
 local function isKatanaEquipped()
@@ -5796,7 +6203,7 @@ end
 
 task.spawn(function()
     while not SCRIPT_KILLED do
-        task.wait(0.15)
+        task.wait(0.25)
         if updateLiveStatus and whitelistGui.Enabled then pcall(updateLiveStatus) end
     end
 end)
@@ -5930,6 +6337,27 @@ local AIM_BODY_PARTS = {
 }
 
 local AIM_TARGET_RNG = Random.new()
+-- Prediction tuning (independent of the strength setting).
+-- predictionScale: how far ahead of the body the aim point leads (lower = less lead).
+-- lateralLead: extra sideways lead applied while the camera is rotating onto the target.
+-- maxResist: at strength 100, the fraction of your mouse movement AWAY from the target
+-- that gets cancelled each frame.
+-- breakAngle / releaseTime: once you pull away by about breakAngle degrees (steady push or a
+-- flick) the lock lets go, then fades back in over releaseTime seconds. Raise breakAngle for
+-- a stickier lock, lower it for an easier break.
+-- (all kept in one table to stay under Lua's local-variable limit)
+local AIM_TUNE = {
+    predictionScale = 0.45,
+    lateralLead = 0.0018,
+    maxResist = 0.75,
+    breakAngle = 2.2,   -- degrees of sustained pull-away (at strength 100) that breaks the lock
+    releaseTime = 0.45, -- seconds the lock stays weak after you break away, then fades back in
+    push = 0,
+    releaseUntil = 0,
+    releaseStart = 0,
+    lastLook = nil,
+    lastLookChar = nil,
+}
 local AIM_LAST_PART = nil
 local AIM_LAST_TARGET = nil
 local AIM_PART_CHANGE_AT = 0
@@ -5990,14 +6418,13 @@ local function getPredictedAimPosition(part, humanoid, camera)
     local horizontalVelocity = Vector3.new(velocity.X, 0, velocity.Z)
     local speed = horizontalVelocity.Magnitude
     local distance = (root.Position - camera.CFrame.Position).Magnitude
-    local strength = getAimStrengthLevel() / 100
-
     local lead = math.clamp(
         0.008 + speed * 0.00072 + distance * 0.000024,
         0.008,
         0.052
     )
-    lead = lead * (0.32 + strength * 0.68)
+    -- Prediction is the SAME at every strength setting (strength only changes how hard it locks).
+    lead = lead * AIM_TUNE.predictionScale
 
     local localCharacter = LocalPlayer.Character
     local localRoot = localCharacter and localCharacter:FindFirstChild("HumanoidRootPart")
@@ -6206,13 +6633,17 @@ end
 
 resetAimAssistState = function()
     AIM_ASSIST_TARGET = nil
+    AIM_TUNE.lastLook = nil
+    AIM_TUNE.lastLookChar = nil
+    AIM_TUNE.push = 0
+    AIM_TUNE.releaseUntil = 0
     AIM_LAST_PART = nil
     AIM_LAST_TARGET = nil
     AIM_PART_CHANGE_AT = 0
     AIM_TARGET_HOLD_UNTIL = 0
 end
 
-local function applyAimAssistCorrection(camera, targetPart, dt)
+AIM_TUNE.core = function(camera, targetPart, dt)
     if not targetPart or not targetPart.Parent then
         return false
     end
@@ -6229,6 +6660,60 @@ local function applyAimAssistCorrection(camera, targetPart, dt)
     end
 
     local desiredPosition = getPredictedAimPosition(targetPart, humanoid, camera)
+
+    -- Stickiness (camlock feel). "lock" is 0 at low strength and ramps smoothly to 1 at 100
+    -- (correction^2), so there is no sudden jump from legit to blatant.
+    local lock = correction * correction
+    local nowT = os.clock()
+
+    -- "grip" is 1 normally, drops to ~0.08 right after you break away from the target, then
+    -- fades back to 1, so a deliberate pull-away always works even at strength 100.
+    local grip = 1
+    if nowT < AIM_TUNE.releaseUntil then
+        local left = (AIM_TUNE.releaseUntil - nowT) / AIM_TUNE.releaseTime
+        grip = 1 - math.clamp(left, 0, 1) * 0.92
+    end
+
+    -- Resist mouse movement away from the target: compare where we left the camera last frame
+    -- with where it is now. Any increase in angle to the target was caused by you moving the
+    -- mouse, so cancel a strength-scaled fraction of it by rotating back toward the target.
+    if AIM_TUNE.lastLook and AIM_TUNE.lastLookChar == character then
+        local camPos0 = camera.CFrame.Position
+        local want0 = (desiredPosition - camPos0)
+        if want0.Magnitude > 1e-3 then
+            want0 = want0.Unit
+            local cur0 = camera.CFrame.LookVector
+            local errBefore = math.acos(math.clamp(AIM_TUNE.lastLook:Dot(want0), -1, 1))
+            local errNow = math.acos(math.clamp(cur0:Dot(want0), -1, 1))
+            local away = errNow - errBefore
+
+            -- track how hard/long you are pulling away (decays when you stop)
+            if away > 0 then
+                AIM_TUNE.push = AIM_TUNE.push * 0.85 + away
+            else
+                AIM_TUNE.push = AIM_TUNE.push * 0.6
+            end
+            -- the more lock, the more push it takes to break, but it is always breakable
+            local breakRad = math.rad(AIM_TUNE.breakAngle) * (0.5 + 0.5 * lock)
+            if AIM_TUNE.push > breakRad and nowT >= AIM_TUNE.releaseUntil then
+                AIM_TUNE.releaseUntil = nowT + AIM_TUNE.releaseTime
+                AIM_TUNE.push = 0
+                grip = 0.08
+            end
+
+            if away > 1e-5 then
+                local back = math.min(away * lock * AIM_TUNE.maxResist * grip, errNow)
+                local ax = cur0:Cross(want0)
+                if ax.Magnitude > 1e-5 then
+                    camera.CFrame = CFrame.lookAt(
+                        camPos0,
+                        camPos0 + CFrame.fromAxisAngle(ax.Unit, back) * cur0
+                    )
+                end
+            end
+        end
+    end
+
     local viewport = camera.ViewportSize
     local center = Vector2.new(viewport.X * 0.5, viewport.Y * 0.5)
     local screenPosition, visible = camera:WorldToViewportPoint(desiredPosition)
@@ -6271,7 +6756,7 @@ local function applyAimAssistCorrection(camera, targetPart, dt)
         )
         local relativeVelocity = targetVelocity - ownVelocity * 0.35
         local lateral = relativeVelocity - currentDirection * relativeVelocity:Dot(currentDirection)
-        local leadStrength = 0.0008 + correction * 0.0038
+        local leadStrength = AIM_TUNE.lateralLead
 
         if lateral.Magnitude > 0.5 then
             desiredDirection = (desiredDirection + lateral * leadStrength).Unit
@@ -6294,15 +6779,16 @@ local function applyAimAssistCorrection(camera, targetPart, dt)
     local proximityFactor = 1 - distanceFactor
 
     local correctionAlpha = math.clamp(
-        response * (0.17 + proximityFactor * 0.62 + correction * 0.20),
+        response * (0.17 + proximityFactor * 0.62 + correction * 0.20)
+            + lock * (0.10 + proximityFactor * 0.16),
         0,
-        0.52
+        0.52 + lock * 0.30
     )
 
-    local maxAngle = math.rad(0.10 + correction * 2.35)
+    local maxAngle = math.rad(0.10 + correction * 2.35 + lock * 3.5)
         * math.clamp(dt * 60, 0.5, 1.5)
 
-    local appliedAngle = math.min(angle * correctionAlpha, maxAngle)
+    local appliedAngle = math.min(angle * correctionAlpha, maxAngle) * grip
     if appliedAngle <= 0 then
         return true
     end
@@ -6319,6 +6805,14 @@ local function applyAimAssistCorrection(camera, targetPart, dt)
         cameraPosition + rotation * currentDirection
     )
     return true
+end
+
+local function applyAimAssistCorrection(camera, targetPart, dt)
+    local result = AIM_TUNE.core(camera, targetPart, dt)
+    -- remember where we left the camera so next frame can tell how much the mouse moved it
+    AIM_TUNE.lastLook = camera.CFrame.LookVector
+    AIM_TUNE.lastLookChar = targetPart and targetPart.Parent or nil
+    return result
 end
 
 fireTriggeredShot = function()
@@ -6624,3 +7118,4 @@ RunService:BindToRenderStep("Triggerbot_RenderStep", Enum.RenderPriority.Input.V
         return
     end
 end)
+
