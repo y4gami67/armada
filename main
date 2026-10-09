@@ -584,6 +584,10 @@ local function finishAimAssistBind(input)
 
     if input.UserInputType == Enum.UserInputType.Keyboard
         and input.KeyCode == Enum.KeyCode.Escape then
+        -- ESC clears the keybind (leaves it unbound) instead of cancelling.
+        AIM_BIND.key = nil
+        AIM_ASSIST_KEYCODE = Enum.KeyCode.Unknown
+        AIM_ASSIST_KEY_LABEL = "NONE"
         AIM_ASSIST_BIND_LISTENING = false
         AIM_BIND.held, AIM_BIND.toggled = false, false
         if AIM_BIND.refresh then AIM_BIND.refresh() end
@@ -2239,7 +2243,7 @@ UI.resetAllSettings = function()
     UI_KILL_KEYCODE, UI_KILL_KEY_LABEL = Enum.KeyCode.F7, "F7"
     UI_BIND_LISTENING = nil
     if UI._refreshUIKeybindButtons then UI._refreshUIKeybindButtons() end
-    if UI._uiKeybindStatus then UI._uiKeybindStatus.Text = "Click a keybind, then press any keyboard key. ESC cancels." end
+    if UI._uiKeybindStatus then UI._uiKeybindStatus.Text = "Click a keybind, then press any keyboard key. ESC unbinds." end
 
     -- Host selection and any in-flight colorbot state.
     selectedActivator = nil
@@ -3413,13 +3417,11 @@ UI.refreshers = {}
         return lbl -- text pills were replaced by full-row dark cards (see W.card)
     end
 
-    -- Card backgrounds behind rows / headers / preset buttons. Pick a look in Settings > Look.
+    -- Card backgrounds behind rows / headers / preset buttons. Fixed to the Subtle look.
     UI.cardStyles = {
-        Frosted = { color = Color3.fromRGB(255, 255, 255), row = 0.90, section = 0.84, stroke = 0.80 },
         Subtle  = { color = Color3.fromRGB(255, 255, 255), row = 0.95, section = 0.91, stroke = 0.88 },
-        Dark    = { color = Color3.fromRGB(16, 16, 19),    row = 0.40, section = 0.22, stroke = 0.93 },
     }
-    UI.cardStyle = "Frosted"
+    UI.cardStyle = "Subtle"
     UI._cards = {}
     function UI.styleCard(entry)
         local st = UI.cardStyles[UI.cardStyle]
@@ -3434,7 +3436,7 @@ UI.refreshers = {}
         return entry
     end
     function UI.applyCardStyle(name)
-        if name and UI.cardStyles[name] then UI.cardStyle = name end
+        UI.cardStyle = "Subtle" -- locked: the row background can't be changed
         for _, entry in ipairs(UI._cards) do
             if entry.inst.Parent then UI.styleCard(entry) end
         end
@@ -4599,7 +4601,7 @@ end)()
     do
         local LIMIT_MIN, LIMIT_MAX = 10, 5000
         local listeningBind = false
-        local MAIN = shell.addSub("Visuals", "General", true)
+        local MAIN = shell.addSub("Visuals", "General")
         local TGT = shell.addSub("Visuals", "Targets")
         local KEYS = shell.addSub("Visuals", "Keybinds")
         local MV = shell.addSub("Movement", "Movement")
@@ -4663,7 +4665,11 @@ end)()
                 if MOVE.listening or MOVE.speedListening then
                     if input.UserInputType == Enum.UserInputType.Keyboard
                         and input.KeyCode ~= Enum.KeyCode.Unknown then
-                        if input.KeyCode ~= Enum.KeyCode.Escape then
+                        if input.KeyCode == Enum.KeyCode.Escape then
+                            -- ESC clears the keybind being set (leaves it unbound)
+                            if MOVE.speedListening then MOVE.speedKey = nil
+                            else MOVE.flyKey = nil end
+                        else
                             if MOVE.speedListening then MOVE.speedKey = input.KeyCode
                             else MOVE.flyKey = input.KeyCode end
                         end
@@ -5020,14 +5026,11 @@ end)()
             end,
             function(v) return tostring(v) .. "%" end)
         W.caption(LOOK, "0% is fully see-through frosted glass (default). 100% makes the window solid.", 28)
-        W.segmented(LOOK, "Row Background", { "Frosted", "Subtle", "Dark" },
-            function() return UI.cardStyle end,
-            function(v) UI.applyCardStyle(v) end)
 
         W.section(KEYS, "UI Controls")
         local hideBtn = W.keybind(KEYS, "Hide UI")
         local killBtn = W.keybind(KEYS, "Kill UI / Script")
-        local status = W.statusLabel(KEYS, "Click a keybind, then press any keyboard key. ESC cancels.")
+        local status = W.statusLabel(KEYS, "Click a keybind, then press any keyboard key. ESC unbinds.")
         local function refreshUIKeys()
             hideBtn.Text = (UI_BIND_LISTENING == "HIDE") and "PRESS A KEY..." or UI_HIDE_KEY_LABEL
             killBtn.Text = (UI_BIND_LISTENING == "KILL") and "PRESS A KEY..." or UI_KILL_KEY_LABEL
@@ -5035,13 +5038,13 @@ end)()
         hideBtn.MouseButton1Click:Connect(function()
             if dead() then return end
             UI_BIND_LISTENING = "HIDE"
-            status.Text = "Press the new HIDE UI key. ESC cancels."
+            status.Text = "Press the new HIDE UI key. ESC unbinds."
             refreshUIKeys()
         end)
         killBtn.MouseButton1Click:Connect(function()
             if dead() then return end
             UI_BIND_LISTENING = "KILL"
-            status.Text = "Press the new KILL UI / SCRIPT key. ESC cancels."
+            status.Text = "Press the new KILL UI / SCRIPT key. ESC unbinds."
             refreshUIKeys()
         end)
         UI._refreshUIKeybindButtons = refreshUIKeys
@@ -5497,6 +5500,20 @@ setTriggerBinding = function(input)
         if input.KeyCode == Enum.KeyCode.Unknown then
             return false
         end
+        if input.KeyCode == Enum.KeyCode.Escape then
+            -- ESC clears the keybind (leaves it unbound).
+            TRIGGER_KEY = nil
+            TRIGGER_KEYCODE = Enum.KeyCode.Unknown
+            TRIGGER_KEY_LABEL = "NONE"
+            TRIGGER_HELD, TRIGGER_TOGGLED, TRIGGER_BIND_LISTENING = false, false, false
+            cancelHostTrigger()
+            resetHostRound()
+            updateTriggerBindText()
+            if selectedActivator then
+                target1Status.Text = "HOST: " .. selectedActivator.Name .. " — " .. (TRIGGER_MODE == "Toggle" and "toggle " or "hold ") .. TRIGGER_KEY_LABEL .. " before the shot."
+            end
+            return true
+        end
         TRIGGER_KEY = nil
         TRIGGER_KEYCODE = input.KeyCode
         TRIGGER_KEY_LABEL = input.KeyCode.Name
@@ -5550,9 +5567,17 @@ local function setUIKeybindFromInput(input)
     end
 
     if input.KeyCode == Enum.KeyCode.Escape then
+        -- ESC clears the keybind being set (leaves it unbound)
+        local which = UI_BIND_LISTENING
+        if which == "HIDE" then
+            UI_HIDE_KEYCODE, UI_HIDE_KEY_LABEL = Enum.KeyCode.Unknown, "NONE"
+        else
+            UI_KILL_KEYCODE, UI_KILL_KEY_LABEL = Enum.KeyCode.Unknown, "NONE"
+        end
         UI_BIND_LISTENING = nil
+        UI_KEY_ASSIGN_IGNORE_UNTIL = os.clock() + 0.25
         if UI._uiKeybindStatus then
-            UI._uiKeybindStatus.Text = "Keybind change cancelled."
+            UI._uiKeybindStatus.Text = (which == "HIDE" and "HIDE UI" or "KILL UI / SCRIPT") .. " key unbound."
         end
         if UI._refreshUIKeybindButtons then
             UI._refreshUIKeybindButtons()
@@ -6242,6 +6267,10 @@ local function finishTriggerbotBind(input)
     end
 
     if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == Enum.KeyCode.Escape then
+        -- ESC clears the keybind (leaves it unbound) instead of cancelling.
+        TB_KEY = nil
+        TB_KEYCODE = Enum.KeyCode.Unknown
+        TB_KEY_LABEL = "NONE"
         TB_BIND_LISTENING = false
         TB_HELD, TB_TOGGLED = false, false
         if TB_PAGE_REFRESH then TB_PAGE_REFRESH() end
